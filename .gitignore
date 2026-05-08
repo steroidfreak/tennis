@@ -1,0 +1,42 @@
+# ── Secrets ────────────────────────────────────────────────────────
+.env
+*.env
+.env.*
+# Allow the safe example template (must come AFTER the .env.* rule, no inline comment)
+!.env.example
+
+# ── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+ENV/
+
+# ── Playwright ─────────────────────────────────────────────────────
+playwright-report/
+test-results/
+
+# ── OS / editor ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Temporary analysis output (never needed in repo) ───────────────
+dafabet_structure.txt
+dafabet_match.txt
+tennis_analysis.json
+tennis_page.png
+*_analysis.txt
+*_analysis.json
