@@ -504,6 +504,114 @@ async def expand_all_sections(page: Page) -> int:
     return len(closed)
 
 
+# JS that finds the element actually responsible for scrolling the match list.
+# On Dafabet the scrollbar is usually on an inner div (overflow:auto), NOT the
+# window — so window.scrollTo() does nothing. We pick the scrollable element
+# (scrollHeight > clientHeight) that contains the most live-match links.
+_FIND_SCROLLER_JS = """
+() => {
+    const matchRe = /\\/en\\/live\\/\\d+-.+-vs-/;
+    const links = [...document.querySelectorAll('a[href]')].filter(
+        a => { try { return matchRe.test(new URL(a.href).pathname); } catch (e) { return false; } }
+    );
+    if (links.length === 0) return { found: false };
+
+    // For each match link, walk up to the nearest scrollable ancestor and tally.
+    const tally = new Map();
+    const isScrollable = el => {
+        if (!el || el === document.body || el === document.documentElement) return false;
+        const cs = getComputedStyle(el);
+        const oy = cs.overflowY;
+        return (oy === 'auto' || oy === 'scroll' || oy === 'overlay')
+               && el.scrollHeight > el.clientHeight + 20;
+    };
+    for (const link of links) {
+        let el = link.parentElement;
+        for (let d = 0; d < 25 && el; d++) {
+            if (isScrollable(el)) { tally.set(el, (tally.get(el) || 0) + 1); break; }
+            el = el.parentElement;
+        }
+    }
+    let best = null, bestCount = 0;
+    for (const [el, c] of tally) { if (c > bestCount) { best = el; bestCount = c; } }
+    if (best) {
+        // Tag it so Python can reference it by a data attribute.
+        best.setAttribute('data-tennis-scroller', '1');
+        return { found: true, scrollHeight: best.scrollHeight, clientHeight: best.clientHeight };
+    }
+    return { found: false };
+}
+"""
+
+
+async def _scroll_metrics(page: Page) -> dict:
+    """Return scroll metrics for the tagged inner scroller, or the window."""
+    return await page.evaluate(
+        """
+        () => {
+            const el = document.querySelector('[data-tennis-scroller="1"]');
+            if (el) return { inner: true, top: el.scrollTop,
+                             height: el.scrollHeight, client: el.clientHeight };
+            return { inner: false, top: window.scrollY,
+                     height: document.documentElement.scrollHeight,
+                     client: window.innerHeight };
+        }
+        """
+    )
+
+
+async def _scroll_to(page: Page, y: int) -> None:
+    """Scroll the tagged inner scroller (preferred) or the window to position y."""
+    await page.evaluate(
+        """
+        (y) => {
+            const el = document.querySelector('[data-tennis-scroller="1"]');
+            if (el) el.scrollTo(0, y);
+            else window.scrollTo(0, y);
+        }
+        """,
+        y,
+    )
+
+
+async def scroll_to_load_all(page: Page) -> None:
+    """
+    Dafabet lazy-renders / virtualizes match cards — only cards near the viewport
+    are kept in the DOM, and the scrollbar lives on an INNER container (not the
+    window). Detect that container, then step-scroll it top→bottom, pausing so
+    new cards mount. Repeat sweeps until the scrollable height stops growing.
+    """
+    info = await page.evaluate(_FIND_SCROLLER_JS)
+    if info.get("found"):
+        print(f"  [*] Using inner scroll container "
+              f"(scrollHeight={info['scrollHeight']}, clientHeight={info['clientHeight']}).")
+    else:
+        print("  [*] No inner scroll container found — falling back to window scroll.")
+
+    last_height = 0
+    for sweep in range(12):
+        m = await _scroll_metrics(page)
+        height, client = m["height"], m["client"]
+        step = max(int(client * 0.8), 200)
+        y = 0
+        while y < height:
+            await _scroll_to(page, y)
+            await page.wait_for_timeout(250)
+            y += step
+        # Final nudge to the true bottom
+        await _scroll_to(page, height)
+        await page.wait_for_timeout(600)
+
+        new_m = await _scroll_metrics(page)
+        if new_m["height"] <= last_height:
+            break
+        last_height = new_m["height"]
+
+    # Back to top so the harvest starts from a known position
+    await _scroll_to(page, 0)
+    await page.wait_for_timeout(400)
+
+
 async def extract_matches(page: Page, url: str) -> list[dict]:
     """
     Reload the tennis listing page, expand ALL collapsed sections, then return
@@ -526,7 +634,54 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
     if n_expanded:
         print(f"  [*] {n_expanded} section(s) expanded.")
 
-    entries: list[dict] = await page.evaluate(
+    # ── Scroll through the page so virtualized/lazy cards mount ────
+    await scroll_to_load_all(page)
+
+    # Expanding may have revealed more collapsed sections; expand again
+    n_expanded2 = await expand_all_sections(page)
+    if n_expanded2:
+        print(f"  [*] {n_expanded2} additional section(s) expanded after scroll.")
+        await scroll_to_load_all(page)
+
+    # Collect entries while scrolling, in case the list virtualizes
+    # (cards above the viewport unmount). Each pass extracts what's currently
+    # in the DOM, merging by URL.
+    collected: dict[str, dict] = {}
+
+    async def _harvest_pass() -> None:
+        page_entries: list[dict] = await page.evaluate(_EXTRACT_MATCHES_JS)
+        for e in page_entries:
+            collected[e["url"]] = e
+
+    # Initial harvest at top
+    await _scroll_to(page, 0)
+    await page.wait_for_timeout(300)
+    await _harvest_pass()
+
+    # Scroll down in chunks (inner container or window), harvesting at each stop
+    m = await _scroll_metrics(page)
+    height, client = m["height"], m["client"]
+    step = max(int(client * 0.6), 150)
+    y = 0
+    while y < height:
+        await _scroll_to(page, y)
+        await page.wait_for_timeout(350)
+        await _harvest_pass()
+        # Re-read height in case more content mounted as we scrolled
+        m = await _scroll_metrics(page)
+        height = max(height, m["height"])
+        y += step
+
+    await _scroll_to(page, height)
+    await page.wait_for_timeout(500)
+    await _harvest_pass()
+
+    entries = list(collected.values())
+    print(f"  [*] Collected {len(entries)} match entries after scroll-harvest.")
+    return entries
+
+
+_EXTRACT_MATCHES_JS = (
         """
         () => {
             const matchRe = /\\/en\\/live\\/\\d+-.+-vs-/;
@@ -597,8 +752,7 @@ async def extract_matches(page: Page, url: str) -> list[dict]:
             return results;
         }
         """
-    )
-    return entries
+)
 
 
 # ── Telegram helpers ───────────────────────────────────────────────
