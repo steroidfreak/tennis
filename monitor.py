@@ -476,17 +476,22 @@ async def expand_all_sections(page: Page) -> int:
     """
     Click every collapsed league/group header so all hidden matches become visible.
 
-    Confirmed structure (2026-02-27 analysis):
-      Collapsed header: div[data-state="closed"][class*="bg-th-card-container"]
-      Expanded header:  div[data-state="open"][class*="bg-th-card-container"]
+    Confirmed structure (2026-06-15 analysis):
+      Collapsed header: div[data-state="closed"][class*="bg-th-rb-transparent-15"]
+      Expanded header:  div[data-state="open"][class*="bg-th-rb-transparent-15"]
+    (Dafabet renamed the old "bg-th-card-container" class.)
 
     Returns the number of sections that were expanded.
     """
     # Grab all collapsed headers as element handles (must be done before clicking,
-    # since clicking one can reflow the DOM)
+    # since clicking one can reflow the DOM). Try the current class first, then
+    # fall back to any data-state="closed" header so a future rename degrades
+    # gracefully instead of silently expanding nothing.
     closed = await page.query_selector_all(
-        'div[data-state="closed"][class*="bg-th-card-container"]'
+        'div[data-state="closed"][class*="bg-th-rb-transparent-15"]'
     )
+    if not closed:
+        closed = await page.query_selector_all('div[data-state="closed"]')
     if not closed:
         return 0
 
@@ -700,7 +705,7 @@ _EXTRACT_MATCHES_JS = (
                 let secEl = link.parentElement;
                 for (let sd = 0; sd < 20 && secEl; sd++) {
                     const sc = secEl.getAttribute('class') || '';
-                    if (sc.includes('bg-th-card-container') && secEl.hasAttribute('data-state')) {
+                    if ((sc.includes('bg-th-rb-transparent-15') || sc.includes('bg-th-card-container')) && secEl.hasAttribute('data-state')) {
                         for (const ch of secEl.children) {
                             const t = ch.innerText ? ch.innerText.trim().split(String.fromCharCode(10))[0] : '';
                             if (t.length > 2 && t.length < 120 && !t.includes(' vs ') && !t.includes('/')) {
@@ -719,7 +724,8 @@ _EXTRACT_MATCHES_JS = (
                 for (let depth = 0; depth < 8 && container; depth++) {
                     const nameDivs = [...container.querySelectorAll('div')].filter(d => {
                         const c = cls(d);
-                        return c.includes('truncate') && c.includes('text-th-primary-text');
+                        return c.includes('truncate') &&
+                               (c.includes('text-th-rb-text-light') || c.includes('text-th-primary-text'));
                     });
                     if (nameDivs.length >= 2) {
                         // Detect "Not Started" status visible in the card on the listing page
