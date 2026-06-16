@@ -841,16 +841,31 @@ _EXTRACT_MATCHES_JS = (
 # ── Telegram helpers ───────────────────────────────────────────────
 
 async def send_telegram(text: str) -> None:
-    async with httpx.AsyncClient(timeout=10) as client:
+    # Generous timeout + retries: Telegram can be slow/flaky from a VPS, and the
+    # default 10s connect window was timing out (empty-string exceptions).
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for bot_token, chat_id in TELEGRAM_RECIPIENTS:
             api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-            try:
-                resp = await client.post(api_url, json=payload)
-                if not resp.is_success:
-                    print(f"[Telegram] {chat_id}: {resp.status_code}: {resp.text[:200]}")
-            except Exception as exc:
-                print(f"[Telegram] {chat_id}: error: {exc}")
+            for attempt in range(1, 4):   # up to 3 tries
+                try:
+                    resp = await client.post(api_url, json=payload)
+                    if resp.is_success:
+                        break
+                    # Telegram returns JSON with a 'description' explaining failures
+                    # (bad token, chat not found, HTML parse error, rate limit…).
+                    print(f"[Telegram] {chat_id}: HTTP {resp.status_code}: {resp.text[:300]}")
+                    # 4xx (bad token/chat/markup) won't fix on retry; stop early.
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        break
+                except Exception as exc:
+                    # Show the exception TYPE — many httpx timeout errors have an
+                    # empty str(), which is why earlier logs showed "error:" blank.
+                    print(f"[Telegram] {chat_id}: attempt {attempt}/3 "
+                          f"{type(exc).__name__}: {exc!r}")
+                if attempt < 3:
+                    await asyncio.sleep(3)
 
 
 def _seconds_until_next_7am_utc() -> float:
