@@ -99,8 +99,15 @@ AI_ANALYSIS: bool = os.getenv("AI_ANALYSIS", "true").lower() in ("1", "true", "y
 # MiniMax API key – required when AI_ANALYSIS=true
 MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 
-# Tennis live page URL
-TENNIS_URL: str = "https://sports.dafabet.com/en/live/sport/239-TENN"
+# Sports to monitor — add or remove entries here to change coverage
+SPORTS: list[dict] = [
+    {"name": "Tennis",     "emoji": "🎾", "url": "https://sports.dafabet.com/en/live/sport/239-TENN"},
+    {"name": "Basketball", "emoji": "🏀", "url": "https://sports.dafabet.com/en/live/sport/227-BASK"},
+    {"name": "Volleyball", "emoji": "🏐", "url": "https://sports.dafabet.com/en/live/sport/1200-VOLL"},
+]
+
+# Keep TENNIS_URL as an alias for the --debug flag
+TENNIS_URL: str = SPORTS[0]["url"]
 
 # File used to persist alerted pairs across restarts
 PAIRS_FILE: Path = Path(".alerted_pairs.json")
@@ -904,7 +911,7 @@ def _seconds_until_next_7am_utc() -> float:
 
 async def heartbeat_loop(
     started_at:      datetime,
-    current_matches: list[dict],
+    current_matches: dict[str, list[dict]],   # sport name → entries
     pending_reports: list[dict],
 ) -> None:
     """
@@ -922,14 +929,17 @@ async def heartbeat_loop(
         minutes     = rem // 60
         now_str     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        if current_matches:
-            match_lines = "\n".join(
-                f"  {i + 1}. {e['home']} vs {e['away']}"
-                for i, e in enumerate(current_matches)
-            )
-            match_section = f"\n\n🎾 <b>Live matches ({len(current_matches)}):</b>\n{match_lines}"
-        else:
-            match_section = "\n\n🎾 No live matches right now."
+        match_section = ""
+        for sport in SPORTS:
+            sname = sport["name"]
+            semoji = sport["emoji"]
+            entries = current_matches.get(sname, [])
+            live = [e for e in entries if not e.get("not_started")]
+            if live:
+                lines = "\n".join(f"  {i+1}. {e['home']} vs {e['away']}" for i, e in enumerate(live))
+                match_section += f"\n\n{semoji} <b>{sname} live ({len(live)}):</b>\n{lines}"
+            else:
+                match_section += f"\n\n{semoji} {sname}: no live matches right now."
 
         # Count reports accumulated since last heartbeat for the summary line
         n_reports = len(pending_reports)
@@ -1186,16 +1196,162 @@ async def investigate_and_decide(
 
 # ── Entry point ────────────────────────────────────────────────────
 
+async def _process_sport(
+    sport:           dict,
+    page:            Page,
+    context:         object,
+    alerted_pairs:   set[frozenset],
+    pending_reports: list[dict],
+    ai_enabled:      bool,
+) -> set[str]:
+    """
+    Scrape one sport page, run duplicate detection + AI analysis, send alerts.
+    Returns (entries, current_url_set) — entries for heartbeat, URLs to expire old pairs.
+    """
+    sname  = sport["name"]
+    semoji = sport["emoji"]
+    surl   = sport["url"]
+
+    entries = await extract_matches(page, surl)
+    current_urls = {e["url"] for e in entries}
+
+    if not entries:
+        print(f"[!] {sname}: no live matches found – will retry.")
+        return entries, current_urls
+
+    live_entries        = [e for e in entries if not e.get("not_started")]
+    not_started_entries = [e for e in entries if e.get("not_started")]
+
+    print(f"\n[*] {semoji} {sname}: {len(entries)} match(es) "
+          f"({len(live_entries)} live, {len(not_started_entries)} not started):")
+    for e in live_entries:
+        print(f"    [LIVE]        {e['home']} vs {e['away']}")
+    for e in not_started_entries:
+        print(f"    [NOT STARTED] {e['home']} vs {e['away']}  ← excluded from checks")
+
+    # ── Rule-based duplicate detection ───────────────────────────────
+    suspects = detect_duplicates(live_entries)
+    new_suspects = [s for s in suspects if s["pair_key"] not in alerted_pairs]
+
+    if new_suspects:
+        print(f"\n[!] {sname}: {len(new_suspects)} new duplicate pair(s) detected!")
+        for s in new_suspects:
+            a = s["match_a"]
+            b = s["match_b"]
+            pct   = int(s["score"] * 100)
+            label = confidence_label(s["score"])
+
+            print(
+                f"  [{label} – {pct}%]\n"
+                f"    A: {a['home']} vs {a['away']}\n"
+                f"    B: {b['home']} vs {b['away']}\n"
+                f"{s['explanation']}"
+            )
+
+            should_alert, report_path = await investigate_and_decide(
+                context, a, b, "DUPLICATE", s["explanation"], pending_reports
+            )
+            alerted_pairs.add(s["pair_key"])
+
+            if not should_alert:
+                continue
+
+            report_note = f"\n\nReport saved: {report_path}" if report_path else ""
+            msg = (
+                f"{semoji} <b>Possible duplicate {sname} match!</b>\n"
+                f"Confidence: <b>{label} ({pct}%)</b>\n\n"
+                f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
+                f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"
+                f"Name comparison:\n"
+                f"{s['explanation']}\n\n"
+                f"<a href='{a['url']}'>Open Match A</a>\n"
+                f"<a href='{b['url']}'>Open Match B</a>"
+                f"{report_note}"
+            )
+            await send_telegram(msg)
+        save_alerted_pairs(alerted_pairs)
+    else:
+        print(f"    {sname}: no duplicates detected in this cycle.")
+
+    # ── AI analysis ───────────────────────────────────────────────────
+    if ai_enabled:
+        print(f"\n[AI] {sname}: running batch analysis (MiniMax-M2.7)…")
+        ai_issues = await ai_analyze_matches(live_entries)
+
+        new_ai = []
+        for issue in ai_issues:
+            idxs = issue.get("match_indices", [])
+            if len(idxs) < 2:
+                continue
+            i, j = idxs[0], idxs[1]
+            if i >= len(live_entries) or j >= len(live_entries) or i < 0 or j < 0:
+                continue
+            pair_key = frozenset([live_entries[i]["url"], live_entries[j]["url"]])
+            if pair_key not in alerted_pairs:
+                issue["pair_key"] = pair_key
+                issue["match_a"]  = live_entries[i]
+                issue["match_b"]  = live_entries[j]
+                new_ai.append(issue)
+
+        if new_ai:
+            print(f"[AI] {sname}: {len(new_ai)} new issue(s) detected!")
+            for issue in new_ai:
+                a    = issue["match_a"]
+                b    = issue["match_b"]
+                kind = issue["type"]
+                conf = issue["confidence"].capitalize()
+                expl = issue["explanation"]
+
+                print(
+                    f"  [{kind} – {conf}]\n"
+                    f"    A: {a['home']} vs {a['away']}\n"
+                    f"    B: {b['home']} vs {b['away']}\n"
+                    f"    {expl}"
+                )
+
+                should_alert, report_path = await investigate_and_decide(
+                    context, a, b, kind, expl, pending_reports
+                )
+                alerted_pairs.add(issue["pair_key"])
+
+                if not should_alert:
+                    continue
+
+                if kind == "PLAYER_CONFLICT":
+                    alert_emoji  = "⚠️"
+                    type_label   = f"Player conflict detected in {sname}! (MiniMax-M2.7)"
+                else:
+                    alert_emoji  = semoji
+                    type_label   = f"Possible duplicate {sname} match! (MiniMax-M2.7)"
+
+                report_note = f"\n\nReport saved: {report_path}" if report_path else ""
+                msg = (
+                    f"{alert_emoji} <b>{type_label}</b>\n"
+                    f"Confidence: <b>{conf}</b>\n\n"
+                    f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
+                    f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"
+                    f"<b>AI analysis:</b> {expl}\n\n"
+                    f"<a href='{a['url']}'>Open Match A</a>\n"
+                    f"<a href='{b['url']}'>Open Match B</a>"
+                    f"{report_note}"
+                )
+                await send_telegram(msg)
+            save_alerted_pairs(alerted_pairs)
+        else:
+            print(f"[AI] {sname}: no new issues detected.")
+
+    return entries, current_urls
+
+
 async def main() -> None:
     started_at       = datetime.now(timezone.utc)
     alerted_pairs    = load_alerted_pairs()
-    pending_reports: list[dict] = []   # anomaly summaries queued for next heartbeat
+    pending_reports: list[dict] = []
     if alerted_pairs:
         print(f"[*] Loaded {len(alerted_pairs)} previously alerted pair(s) from disk.")
 
-    # ── AI provider setup ──────────────────────────────────────────────
+    # ── AI provider setup ─────────────────────────────────────────────
     ai_enabled: bool = False
-
     if AI_ANALYSIS:
         if MINIMAX_API_KEY:
             ai_enabled = True
@@ -1204,21 +1360,23 @@ async def main() -> None:
             print("[!] AI_ANALYSIS=true but MINIMAX_API_KEY not set – AI disabled.")
 
     # ── Send startup ping BEFORE browser loads ────────────────────────
-    ai_status = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
+    sport_names = ", ".join(s["name"] for s in SPORTS)
+    ai_status   = "MiniMax-M2.7 ✓" if ai_enabled else "rule-based only"
     await send_telegram(
-        f"🟢 <b>Tennis duplicate monitor starting…</b>\n"
+        f"🟢 <b>Duplicate match monitor starting…</b>\n"
+        f"Sports: <b>{sport_names}</b>\n"
         f"AI analysis: <b>{ai_status}</b>\n"
         f"Polling every {CHECK_INTERVAL}s · Heartbeat daily at 07:00 UTC\n"
         f"Started at: {started_at.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
-    # Shared list updated each scrape cycle; read by heartbeat_loop
-    current_matches: list[dict] = []
+    # Shared dict updated each cycle; read by heartbeat_loop
+    current_matches: dict[str, list[dict]] = {s["name"]: [] for s in SPORTS}
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=HEADLESS,
-            slow_mo=0 if HEADLESS else 60,   # no artificial delay needed on VPS
+            slow_mo=0 if HEADLESS else 60,
             args=["--no-sandbox", "--disable-dev-shm-usage"] if HEADLESS else [],
         )
         context = await browser.new_context(
@@ -1232,155 +1390,31 @@ async def main() -> None:
         )
         page = await context.new_page()
 
-        print(f"[*] Starting tennis duplicate detector. Polling every {CHECK_INTERVAL}s.")
+        print(f"[*] Starting duplicate monitor. Sports: {sport_names}. Polling every {CHECK_INTERVAL}s.")
         print(f"[*] Similarity threshold: {SIMILARITY_THRESHOLD}  |  Min per-side: {MIN_SIDE_SCORE}")
-        print(f"[*] Heartbeat: daily at 07:00 UTC")
-        print(f"[*] URL: {TENNIS_URL}\n")
+        print(f"[*] Heartbeat: daily at 07:00 UTC\n")
 
-        # ── Launch heartbeat as a background task ─────────────────────
         heartbeat_task = asyncio.create_task(
             heartbeat_loop(started_at, current_matches, pending_reports)
         )
 
         try:
             while True:
-                entries = await extract_matches(page, TENNIS_URL)
-                current_urls = {e["url"] for e in entries}
+                all_current_urls: set[str] = set()
 
-                # Keep heartbeat_loop up to date with latest match list
-                current_matches.clear()
-                current_matches.extend(entries)
+                for sport in SPORTS:
+                    entries, sport_urls = await _process_sport(
+                        sport, page, context, alerted_pairs, pending_reports, ai_enabled
+                    )
+                    all_current_urls |= sport_urls
+                    current_matches[sport["name"]] = entries
 
-                # ── Expire pairs where a match is no longer live ─────────
-                expired = {pk for pk in alerted_pairs if not pk.issubset(current_urls)}
+                # ── Expire pairs where both matches are gone ──────────────
+                expired = {pk for pk in alerted_pairs if not pk.issubset(all_current_urls)}
                 if expired:
                     print(f"[*] {len(expired)} previously alerted pair(s) expired (match ended).")
                     alerted_pairs -= expired
                     save_alerted_pairs(alerted_pairs)
-
-                if not entries:
-                    print("[!] No live tennis matches found – will retry.")
-                else:
-                    # Separate matches by status detected on the listing page
-                    live_entries       = [e for e in entries if not e.get("not_started")]
-                    not_started_entries = [e for e in entries if e.get("not_started")]
-
-                    print(f"\n[*] {len(entries)} match(es) on listing page "
-                          f"({len(live_entries)} live, {len(not_started_entries)} not started):")
-                    for e in live_entries:
-                        print(f"    [LIVE]        {e['home']} vs {e['away']}")
-                    for e in not_started_entries:
-                        print(f"    [NOT STARTED] {e['home']} vs {e['away']}  ← excluded from checks")
-
-                    suspects = detect_duplicates(live_entries)
-                    new_suspects = [s for s in suspects if s["pair_key"] not in alerted_pairs]
-
-                    if new_suspects:
-                        print(f"\n[!] {len(new_suspects)} new duplicate pair(s) detected!")
-                        for s in new_suspects:
-                            a = s["match_a"]
-                            b = s["match_b"]
-                            pct   = int(s["score"] * 100)
-                            label = confidence_label(s["score"])
-
-                            print(
-                                f"  [{label} – {pct}%]\n"
-                                f"    A: {a['home']} vs {a['away']}\n"
-                                f"    B: {b['home']} vs {b['away']}\n"
-                                f"{s['explanation']}"
-                            )
-
-                            should_alert, report_path = await investigate_and_decide(
-                                context, a, b, "DUPLICATE", s["explanation"], pending_reports
-                            )
-                            alerted_pairs.add(s["pair_key"])  # always suppress re-check
-
-                            if not should_alert:
-                                continue
-
-                            report_note = f"\n\nReport saved: {report_path}" if report_path else ""
-                            msg = (
-                                f"🎾 <b>Possible duplicate tennis match!</b>\n"
-                                f"Confidence: <b>{label} ({pct}%)</b>\n\n"
-                                f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
-                                f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"
-                                f"Name comparison:\n"
-                                f"{s['explanation']}\n\n"
-                                f"<a href='{a['url']}'>Open Match A</a>\n"
-                                f"<a href='{b['url']}'>Open Match B</a>"
-                                f"{report_note}"
-                            )
-                            await send_telegram(msg)
-                        save_alerted_pairs(alerted_pairs)
-                    else:
-                        print("    No duplicates detected in this cycle.")
-
-                    # ── AI analysis ───────────────────────────────────────────
-                    if ai_enabled:
-                        print(f"\n[AI] Running batch analysis (MiniMax-M2.7)…")
-                        ai_issues = await ai_analyze_matches(live_entries)
-
-                        new_ai = []
-                        for issue in ai_issues:
-                            idxs = issue.get("match_indices", [])
-                            if len(idxs) < 2:
-                                continue
-                            i, j = idxs[0], idxs[1]
-                            if i >= len(live_entries) or j >= len(live_entries) or i < 0 or j < 0:
-                                continue
-                            pair_key = frozenset([live_entries[i]["url"], live_entries[j]["url"]])
-                            if pair_key not in alerted_pairs:
-                                issue["pair_key"]  = pair_key
-                                issue["match_a"]   = live_entries[i]
-                                issue["match_b"]   = live_entries[j]
-                                new_ai.append(issue)
-
-                        if new_ai:
-                            print(f"[AI] {len(new_ai)} new issue(s) detected!")
-                            for issue in new_ai:
-                                a    = issue["match_a"]
-                                b    = issue["match_b"]
-                                kind = issue["type"]
-                                conf = issue["confidence"].capitalize()
-                                expl = issue["explanation"]
-
-                                print(
-                                    f"  [{kind} – {conf}]\n"
-                                    f"    A: {a['home']} vs {a['away']}\n"
-                                    f"    B: {b['home']} vs {b['away']}\n"
-                                    f"    {expl}"
-                                )
-
-                                should_alert, report_path = await investigate_and_decide(
-                                    context, a, b, kind, expl, pending_reports
-                                )
-                                alerted_pairs.add(issue["pair_key"])  # always suppress re-check
-
-                                if not should_alert:
-                                    continue
-
-                                if kind == "PLAYER_CONFLICT":
-                                    emoji      = "⚠️"
-                                    type_label = "Player conflict detected! (MiniMax-M2.7)"
-                                else:  # DUPLICATE
-                                    emoji      = "🎾"
-                                    type_label = "Possible duplicate tennis match! (MiniMax-M2.7)"
-
-                                report_note = f"\n\nReport saved: {report_path}" if report_path else ""
-                                msg = (
-                                    f"{emoji} <b>{type_label}</b>\n"
-                                    f"Confidence: <b>{conf}</b>\n\n"
-                                    f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
-                                    f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"
-                                    f"<b>AI analysis:</b> {expl}\n\n"
-                                    f"<a href='{a['url']}'>Open Match A</a>\n"
-                                    f"<a href='{b['url']}'>Open Match B</a>"
-                                    f"{report_note}"
-                                )
-                                await send_telegram(msg)
-                            save_alerted_pairs(alerted_pairs)
-                        else:
-                            print("[AI] No new issues detected.")
 
                 print(f"\n--- sleeping {CHECK_INTERVAL}s ---\n")
                 await asyncio.sleep(CHECK_INTERVAL)
@@ -1390,7 +1424,7 @@ async def main() -> None:
         finally:
             heartbeat_task.cancel()
             await send_telegram(
-                f"🔴 <b>Tennis duplicate monitor stopped</b>\n"
+                f"🔴 <b>Duplicate match monitor stopped</b>\n"
                 f"Stopped at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
             await browser.close()
