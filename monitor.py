@@ -476,37 +476,54 @@ async def expand_all_sections(page: Page) -> int:
     """
     Click every collapsed league/group header so all hidden matches become visible.
 
-    Confirmed structure (2026-06-15 analysis):
-      Collapsed header: div[data-state="closed"][class*="bg-th-rb-transparent-15"]
-      Expanded header:  div[data-state="open"][class*="bg-th-rb-transparent-15"]
-    (Dafabet renamed the old "bg-th-card-container" class.)
+    Re-queries for collapsed headers after each click so stale DOM handles never
+    cause "Element is not attached to the DOM" errors. Loops until no collapsed
+    headers remain or the count stops decreasing (safety guard).
 
-    Returns the number of sections that were expanded.
+    Returns the total number of sections that were expanded.
     """
-    # Grab all collapsed headers as element handles (must be done before clicking,
-    # since clicking one can reflow the DOM). Try the current class first, then
-    # fall back to any data-state="closed" header so a future rename degrades
-    # gracefully instead of silently expanding nothing.
-    closed = await page.query_selector_all(
-        'div[data-state="closed"][class*="bg-th-rb-transparent-15"]'
-    )
-    if not closed:
-        closed = await page.query_selector_all('div[data-state="closed"]')
-    if not closed:
-        return 0
+    SELECTORS = [
+        'div[data-state="closed"][class*="bg-th-rb-transparent-15"]',
+        'div[data-state="closed"][class*="bg-th-card-container"]',
+        'div[data-state="closed"]',
+    ]
 
-    print(f"  [*] Expanding {len(closed)} collapsed section(s)…")
-    for header in closed:
-        try:
-            await header.scroll_into_view_if_needed()
-            await header.click()
-            await page.wait_for_timeout(250)   # let each section animate open
-        except Exception as exc:
-            print(f"  [warn] Could not expand section: {exc}")
+    def _selector(page_):
+        # Return the first selector that matches something (checked lazily below)
+        return SELECTORS
 
-    # Give the last sections a moment to fully render their match cards
-    await page.wait_for_timeout(800)
-    return len(closed)
+    total_expanded = 0
+    prev_count = -1
+
+    while True:
+        # Re-query each iteration so we always have fresh handles
+        closed = []
+        for sel in SELECTORS:
+            closed = await page.query_selector_all(sel)
+            if closed:
+                break
+        if not closed:
+            break
+        if len(closed) == prev_count:
+            # Count didn't change after the last round — nothing new to expand
+            break
+        prev_count = len(closed)
+
+        print(f"  [*] Expanding {len(closed)} collapsed section(s)…")
+        for header in closed:
+            try:
+                # Use JS click via evaluate to avoid stale-handle issues on scroll
+                await page.evaluate("el => el.click()", header)
+                await page.wait_for_timeout(150)
+            except Exception:
+                # Handle detached between the query and the click — harmless, skip it
+                pass
+            total_expanded += 1
+
+        # Let the last batch of sections finish animating open
+        await page.wait_for_timeout(600)
+
+    return total_expanded
 
 
 # JS that finds the element actually responsible for scrolling the match list.
@@ -617,6 +634,51 @@ async def scroll_to_load_all(page: Page) -> None:
     await page.wait_for_timeout(400)
 
 
+async def debug_scrape(page: Page, url: str) -> None:
+    """
+    One-shot diagnostic: load the page and print what the scraper finds vs what
+    CSS classes are actually on the match-card name elements.  Run manually via:
+        asyncio.run(debug_scrape_standalone())
+    """
+    await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+    await page.wait_for_timeout(4_000)
+    await expand_all_sections(page)
+    await scroll_to_load_all(page)
+
+    info = await page.evaluate(
+        """
+        () => {
+            const matchRe = /\\/en\\/live\\/\\d+-.+-vs-/;
+            const results = [];
+            for (const link of document.querySelectorAll('a[href]')) {
+                try { if (!matchRe.test(new URL(link.href).pathname)) continue; } catch (e) { continue; }
+                const href = link.href.split('?')[0];
+                // Walk up and collect class names of divs near the link
+                let el = link.parentElement;
+                const classSnap = [];
+                for (let d = 0; d < 6 && el; d++) {
+                    classSnap.push({ depth: d, tag: el.tagName, cls: (el.getAttribute('class') || '').slice(0, 120) });
+                    el = el.parentElement;
+                }
+                results.push({ href, classSnap });
+                if (results.length >= 3) break;   // first 3 is enough for diagnosis
+            }
+            return results;
+        }
+        """
+    )
+    print("\n=== DIAGNOSTIC: first 3 match link class snapshots ===")
+    for item in info:
+        print(f"\n  Link: {item['href']}")
+        for row in item["classSnap"]:
+            print(f"    depth={row['depth']} <{row['tag']}> class=\"{row['cls']}\"")
+    entries = await page.evaluate(_EXTRACT_MATCHES_JS)
+    print(f"\n=== DIAGNOSTIC: _EXTRACT_MATCHES_JS found {len(entries)} entries ===")
+    for e in entries[:10]:
+        print(f"  {e['home']} vs {e['away']}  | section={e.get('section','')}")
+    print("=== END DIAGNOSTIC ===\n")
+
+
 async def extract_matches(page: Page, url: str) -> list[dict]:
     """
     Reload the tennis listing page, expand ALL collapsed sections, then return
@@ -694,9 +756,20 @@ _EXTRACT_MATCHES_JS = (
             const seen = new Set();
             const results = [];
 
+            // Heuristic: does a short string look like a player/team name?
+            // Names contain letters; exclude pure-digit scores, times, short status words.
+            const looksLikeName = t => {
+                if (!t || t.length < 2 || t.length > 80) return false;
+                if (/^\\d+[:\\-–]\\d+$/.test(t)) return false;  // score like "2-1" or "6:3"
+                if (/^\\d{1,2}:\\d{2}$/.test(t)) return false;  // time like "14:30"
+                if (/^(live|set|game|not started|suspended|walkover|retired|wta|atp|itf|challenger)$/i.test(t.trim())) return false;
+                return /[A-Za-zÀ-ÖØ-öø-ÿ]/.test(t);
+            };
+
             for (const link of document.querySelectorAll('a[href]')) {
                 const href = link.href.split('?')[0];
-                if (!matchRe.test(new URL(link.href).pathname)) continue;
+                try { if (!matchRe.test(new URL(link.href).pathname)) continue; }
+                catch (e) { continue; }
                 if (seen.has(href)) continue;
                 seen.add(href);
 
@@ -718,42 +791,86 @@ _EXTRACT_MATCHES_JS = (
                     secEl = secEl.parentElement;
                 }
 
-                // Walk up from the link to find the card container
+                // ── Strategy 1: class-based (specific known class names) ──────
+                let home = '', away = '';
                 let container = link.parentElement;
-                let found = false;
+                let foundViaClass = false;
                 for (let depth = 0; depth < 8 && container; depth++) {
+                    // Try the two previously observed class patterns, plus a generic truncate search
                     const nameDivs = [...container.querySelectorAll('div')].filter(d => {
                         const c = cls(d);
                         return c.includes('truncate') &&
-                               (c.includes('text-th-rb-text-light') || c.includes('text-th-primary-text'));
+                               (c.includes('text-th-rb-text-light') ||
+                                c.includes('text-th-primary-text') ||
+                                c.includes('text-th-rb-'));
                     });
                     if (nameDivs.length >= 2) {
-                        // Detect "Not Started" status visible in the card on the listing page
-                        const cardText = (container.innerText || '').toLowerCase();
-                        const notStarted = cardText.includes('not started');
-                        results.push({
-                            url:         href,
-                            home:        nameDivs[0].innerText.trim(),
-                            away:        nameDivs[1].innerText.trim(),
-                            section:     section,
-                            not_started: notStarted,
-                        });
-                        found = true;
+                        home = nameDivs[0].innerText.trim();
+                        away = nameDivs[1].innerText.trim();
+                        foundViaClass = true;
                         break;
                     }
                     container = container.parentElement;
                 }
-                if (!found) {
-                    // Fallback: parse names from URL slug
+
+                // ── Strategy 2: structural — collect all leaf text in the card ─
+                // Walk up until we have a container wide enough to hold two player names.
+                if (!foundViaClass || !looksLikeName(home) || !looksLikeName(away)) {
+                    let cardEl = link.parentElement;
+                    for (let depth = 0; depth < 10 && cardEl; depth++) {
+                        // Gather direct-child text nodes and leaf-div text that look like names
+                        const texts = [];
+                        const walk = el => {
+                            for (const ch of el.childNodes) {
+                                if (ch.nodeType === 3) {
+                                    const t = ch.textContent.trim();
+                                    if (looksLikeName(t)) texts.push(t);
+                                } else if (ch.nodeType === 1) {
+                                    const tag = ch.tagName;
+                                    if (['SCRIPT','STYLE','NOSCRIPT'].includes(tag)) continue;
+                                    // Don't recurse into nested links (different match)
+                                    if (tag === 'A' && ch !== link) continue;
+                                    const t = (ch.innerText || '').trim().split(String.fromCharCode(10))[0].trim();
+                                    if (looksLikeName(t) && !texts.includes(t)) texts.push(t);
+                                    walk(ch);
+                                }
+                            }
+                        };
+                        walk(cardEl);
+                        if (texts.length >= 2) {
+                            // The first two name-like strings are home & away
+                            home = texts[0];
+                            away = texts[1];
+                            break;
+                        }
+                        cardEl = cardEl.parentElement;
+                    }
+                }
+
+                // ── Strategy 3: URL slug fallback ─────────────────────────────
+                if (!looksLikeName(home) || !looksLikeName(away)) {
                     const slug = new URL(link.href).pathname.replace('/en/live/', '');
                     const vsIdx = slug.indexOf('-vs-');
                     if (vsIdx !== -1) {
                         const numEnd = slug.indexOf('-');
-                        const homePart = slug.slice(numEnd + 1, vsIdx).replace(/-/g, ' ');
-                        const awayPart = slug.slice(vsIdx + 4).replace(/-/g, ' ');
-                        results.push({ url: href, home: homePart, away: awayPart, section: section, not_started: false });
+                        home = slug.slice(numEnd + 1, vsIdx).replace(/-/g, ' ');
+                        away = slug.slice(vsIdx + 4).replace(/-/g, ' ');
                     }
                 }
+
+                if (!home && !away) continue;
+
+                // Detect "Not Started" status visible in the card on the listing page
+                const cardTextLower = (container ? (container.innerText || '') : '').toLowerCase();
+                const notStarted = cardTextLower.includes('not started');
+
+                results.push({
+                    url:         href,
+                    home:        home,
+                    away:        away,
+                    section:     section,
+                    not_started: notStarted,
+                });
             }
             return results;
         }
@@ -1280,5 +1397,26 @@ async def main() -> None:
             print("[*] Browser closed.")
 
 
+async def _debug_main() -> None:
+    """Run only the diagnostic scrape, then exit.  Usage: python monitor.py --debug"""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
+        await debug_scrape(page, TENNIS_URL)
+        await browser.close()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if "--debug" in sys.argv:
+        asyncio.run(_debug_main())
+    else:
+        asyncio.run(main())

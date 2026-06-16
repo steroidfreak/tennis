@@ -27,7 +27,9 @@
       "Bash(curl:*)",
       "Bash(git checkout:*)",
       "WebFetch(domain:platform.minimax.io)",
-      "Bash(python -c \"\nimport httpx, os\nfrom dotenv import load_dotenv\nload_dotenv\\(\\)\n\nkey = os.getenv\\('MINIMAX_API_KEY'\\)\nresp = httpx.post\\(\n    'https://api.minimax.io/v1/chat/completions',\n    headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},\n    json={'model': 'MiniMax-M2.7', 'messages': [{'role': 'user', 'content': 'Reply with OK only.'}], 'max_tokens': 10},\n    timeout=30\n\\)\nprint\\('Status:', resp.status_code\\)\nprint\\('Response:', resp.json\\(\\)\\)\n\")"
+      "Bash(python -c \"\nimport httpx, os\nfrom dotenv import load_dotenv\nload_dotenv\\(\\)\n\nkey = os.getenv\\('MINIMAX_API_KEY'\\)\nresp = httpx.post\\(\n    'https://api.minimax.io/v1/chat/completions',\n    headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},\n    json={'model': 'MiniMax-M2.7', 'messages': [{'role': 'user', 'content': 'Reply with OK only.'}], 'max_tokens': 10},\n    timeout=30\n\\)\nprint\\('Status:', resp.status_code\\)\nprint\\('Response:', resp.json\\(\\)\\)\n\")",
+      "mcp__Claude_in_Chrome__navigate",
+      "mcp__Claude_in_Chrome__tabs_context_mcp"
     ]
   }
 }
