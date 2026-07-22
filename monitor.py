@@ -763,10 +763,20 @@ _EXTRACT_MATCHES_JS = (
             const seen = new Set();
             const results = [];
 
+            // Hidden toast/tooltip text baked into every card (favourite toggle,
+            // copy-game-code). These divs carry truncate + text-th-rb-* classes,
+            // so class-based extraction would otherwise grab them as "names".
+            const uiToastText = new Set([
+                'removed from favourites', 'added to favourites',
+                'add to favourites', 'remove from favourites',
+                'copied', 'copy link', 'copy', 'link copied',
+            ]);
+
             // Heuristic: does a short string look like a player/team name?
             // Names contain letters; exclude pure-digit scores, times, short status words.
             const looksLikeName = t => {
                 if (!t || t.length < 2 || t.length > 80) return false;
+                if (uiToastText.has(t.trim().toLowerCase())) return false;
                 if (/^\\d+[:\\-–]\\d+$/.test(t)) return false;  // score like "2-1" or "6:3"
                 if (/^\\d{1,2}:\\d{2}$/.test(t)) return false;  // time like "14:30"
                 if (/^(live|set|game|not started|suspended|walkover|retired|wta|atp|itf|challenger)$/i.test(t.trim())) return false;
@@ -798,18 +808,40 @@ _EXTRACT_MATCHES_JS = (
                     secEl = secEl.parentElement;
                 }
 
-                // ── Strategy 1: class-based (specific known class names) ──────
+                // ── Strategy 0: stable data-testid hooks ──────────────────────
+                // Each card is data-testid="event-<id>" and player names sit in
+                // div[data-testid^="scoresbar-opponent-"]. These testids are
+                // distinct from the toast divs (favourite-toggle-message,
+                // game-code-copied-message), so they can't pick up toast text.
                 let home = '', away = '';
+                let card = link.parentElement;
+                for (let depth = 0; depth < 8 && card; depth++) {
+                    const tid = card.getAttribute('data-testid') || '';
+                    if (/^event-\\d+$/.test(tid)) break;
+                    card = card.parentElement;
+                }
+                if (card) {
+                    const opponentDivs = [...card.querySelectorAll('[data-testid^="scoresbar-opponent-"]')]
+                        .map(d => d.innerText.trim())
+                        .filter(looksLikeName);
+                    if (opponentDivs.length >= 2) {
+                        home = opponentDivs[0];
+                        away = opponentDivs[1];
+                    }
+                }
+
+                // ── Strategy 1: class-based (specific known class names) ──────
                 let container = link.parentElement;
                 let foundViaClass = false;
-                for (let depth = 0; depth < 8 && container; depth++) {
+                if (!home || !away) for (let depth = 0; depth < 8 && container; depth++) {
                     // Try the two previously observed class patterns, plus a generic truncate search
                     const nameDivs = [...container.querySelectorAll('div')].filter(d => {
                         const c = cls(d);
-                        return c.includes('truncate') &&
-                               (c.includes('text-th-rb-text-light') ||
-                                c.includes('text-th-primary-text') ||
-                                c.includes('text-th-rb-'));
+                        if (!c.includes('truncate')) return false;
+                        if (!(c.includes('text-th-rb-text-light') ||
+                              c.includes('text-th-primary-text') ||
+                              c.includes('text-th-rb-'))) return false;
+                        return looksLikeName((d.innerText || '').trim());
                     });
                     if (nameDivs.length >= 2) {
                         home = nameDivs[0].innerText.trim();
@@ -822,7 +854,7 @@ _EXTRACT_MATCHES_JS = (
 
                 // ── Strategy 2: structural — collect all leaf text in the card ─
                 // Walk up until we have a container wide enough to hold two player names.
-                if (!foundViaClass || !looksLikeName(home) || !looksLikeName(away)) {
+                if (!looksLikeName(home) || !looksLikeName(away)) {
                     let cardEl = link.parentElement;
                     for (let depth = 0; depth < 10 && cardEl; depth++) {
                         // Gather direct-child text nodes and leaf-div text that look like names
@@ -868,7 +900,8 @@ _EXTRACT_MATCHES_JS = (
                 if (!home && !away) continue;
 
                 // Detect "Not Started" status visible in the card on the listing page
-                const cardTextLower = (container ? (container.innerText || '') : '').toLowerCase();
+                const statusEl = card || container;
+                const cardTextLower = (statusEl ? (statusEl.innerText || '') : '').toLowerCase();
                 const notStarted = cardTextLower.includes('not started');
 
                 results.push({
