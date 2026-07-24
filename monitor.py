@@ -339,6 +339,70 @@ def detect_duplicates(entries: list[dict]) -> list[dict]:
     return suspects
 
 
+def count_side_players(side: str) -> int:
+    """
+    Number of players listed on one side of a match.
+    Doubles pairs are slash-separated: "Frantzen C / Haase R" → 2.
+    """
+    parts = [p.strip() for p in re.split(r"\s*/\s*", side or "") if p.strip()]
+    return len(parts)
+
+
+def detect_malformed_doubles(entries: list[dict]) -> list[dict]:
+    """
+    Flag matches whose two sides list a different number of players, e.g.
+
+        Hapoel Umm Al-Fahm   vs   Frantzen C / Haase R
+        (1 player)                (2 players)
+
+    Doubles always pairs 2 players against 2, so a count mismatch means the
+    listing is corrupt — a partner is missing, or an unrelated name (often a
+    football/basketball club) has been pulled into a tennis doubles slot.
+
+    Also flags a match in a "Doubles" section where BOTH sides show a single
+    name, which is the same corruption applied to both sides.
+
+    Singles matches (1 vs 1) and team sports are unaffected: their sides carry
+    no slash, so the counts match and nothing is flagged.
+    """
+    anomalies = []
+    for e in entries:
+        home_n = count_side_players(e["home"])
+        away_n = count_side_players(e["away"])
+        section = (e.get("section") or "").lower()
+
+        if home_n == 0 or away_n == 0:
+            continue   # empty side — not this check's job
+
+        if home_n != away_n:
+            reason = (
+                f"Player-count mismatch: home lists {home_n} player(s), "
+                f"away lists {away_n}. Doubles must be 2 vs 2."
+            )
+        elif "doubles" in section and home_n == 1:
+            reason = (
+                "Doubles event but both sides list a single player — "
+                "expected 'Name1 / Name2' on each side."
+            )
+        else:
+            continue
+
+        anomalies.append({
+            "match":        e,
+            "home_players": home_n,
+            "away_players": away_n,
+            "explanation": (
+                f"{reason}\n"
+                f"  Home: {e['home']!r}  [{home_n} player(s)]\n"
+                f"  Away: {e['away']!r}  [{away_n} player(s)]\n"
+                f"  Section: {e.get('section') or 'unknown'}"
+            ),
+            # Single-URL key so it slots into the same alerted-pairs store
+            "pair_key":     frozenset([e["url"]]),
+        })
+    return anomalies
+
+
 def confidence_label(score: float) -> str:
     if score >= 0.92:
         return "Very high"
@@ -1002,16 +1066,21 @@ async def heartbeat_loop(
                     if r["decision"] == "ALERTED"
                     else "SKIPPED — one match live, other not started (different dates)"
                 )
+                single  = r.get("single") or r.get("match_b_home") is None
+                label_a = "Match" if single else "Match A"
+                block_b = "" if single else (
+                    f"<b>Match B:</b>  {r['match_b_home']}  vs  {r['match_b_away']}\n"
+                    f"  Status: {r['status_b']}  |  Score: {r['score_b'] or '—'}  |  "
+                    f"Start: {r['start_b'] or '—'}\n\n"
+                )
                 report_msg = (
                     f"{decision_emoji} <b>Anomaly report [{r['type']}]</b>\n"
                     f"Decision : <b>{decision_label}</b>\n"
                     f"Time     : {r['timestamp']}\n\n"
-                    f"<b>Match A:</b>  {r['match_a_home']}  vs  {r['match_a_away']}\n"
+                    f"<b>{label_a}:</b>  {r['match_a_home']}  vs  {r['match_a_away']}\n"
                     f"  Status: {r['status_a']}  |  Score: {r['score_a'] or '—'}  |  "
                     f"Start: {r['start_a'] or '—'}\n\n"
-                    f"<b>Match B:</b>  {r['match_b_home']}  vs  {r['match_b_away']}\n"
-                    f"  Status: {r['status_b']}  |  Score: {r['score_b'] or '—'}  |  "
-                    f"Start: {r['start_b'] or '—'}\n\n"
+                    f"{block_b}"
                     f"<b>Reason:</b> {r['explanation'][:300]}\n\n"
                     f"<b>Full report:</b> <code>{r['file']}</code>"
                 )
@@ -1090,9 +1159,9 @@ async def _extract_match_page_info(page, url: str) -> dict:
 def _save_anomaly_report(
     anomaly_type:    str,
     match_a:         dict,
-    match_b:         dict,
+    match_b:         dict | None,
     info_a:          dict,
-    info_b:          dict,
+    info_b:          dict | None,
     explanation:     str,
     decision:        str,
     pending_reports: list[dict],
@@ -1101,6 +1170,9 @@ def _save_anomaly_report(
     Save a detailed anomaly investigation report to anomaly_reports/ and return the path.
     Also appends a compact summary to pending_reports for the next heartbeat flush.
     decision: "ALERTED" | "SKIPPED_DIFFERENT_STATUS"
+
+    match_b/info_b are None for single-match anomalies (e.g. MALFORMED_LINEUP),
+    in which case the report and heartbeat summary omit the Match B block.
     """
     ANOMALY_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
@@ -1116,23 +1188,10 @@ def _save_anomaly_report(
     def _fmt_texts(texts: list[str]) -> str:
         return "\n    ".join(texts[:40]) if texts else "(none)"
 
-    report = (
-        f"ANOMALY INVESTIGATION REPORT\n"
-        f"============================\n"
-        f"Timestamp : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        f"Type      : {anomaly_type}\n"
-        f"Decision  : {decision}\n\n"
-        f"MATCH A\n"
-        f"-------\n"
-        f"  Home    : {match_a['home']}\n"
-        f"  Away    : {match_a['away']}\n"
-        f"  Section : {match_a.get('section', '')}\n"
-        f"  URL     : {match_a['url']}\n"
-        f"  Status  : {info_a['status']}\n"
-        f"  Score   : {info_a['score']}\n"
-        f"  Start   : {info_a['start_time']}\n"
-        f"  Page texts (first 40):\n"
-        f"    {_fmt_texts(info_a['raw_texts'])}\n\n"
+    single = match_b is None or info_b is None
+    label_a = "MATCH" if single else "MATCH A"
+
+    block_b = "" if single else (
         f"MATCH B\n"
         f"-------\n"
         f"  Home    : {match_b['home']}\n"
@@ -1144,6 +1203,26 @@ def _save_anomaly_report(
         f"  Start   : {info_b['start_time']}\n"
         f"  Page texts (first 40):\n"
         f"    {_fmt_texts(info_b['raw_texts'])}\n\n"
+    )
+
+    report = (
+        f"ANOMALY INVESTIGATION REPORT\n"
+        f"============================\n"
+        f"Timestamp : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Type      : {anomaly_type}\n"
+        f"Decision  : {decision}\n\n"
+        f"{label_a}\n"
+        f"{'-' * len(label_a)}\n"
+        f"  Home    : {match_a['home']}\n"
+        f"  Away    : {match_a['away']}\n"
+        f"  Section : {match_a.get('section', '')}\n"
+        f"  URL     : {match_a['url']}\n"
+        f"  Status  : {info_a['status']}\n"
+        f"  Score   : {info_a['score']}\n"
+        f"  Start   : {info_a['start_time']}\n"
+        f"  Page texts (first 40):\n"
+        f"    {_fmt_texts(info_a['raw_texts'])}\n\n"
+        f"{block_b}"
         f"ALGORITHM EXPLANATION\n"
         f"---------------------\n"
         f"{explanation}\n"
@@ -1157,16 +1236,17 @@ def _save_anomaly_report(
         "type":         anomaly_type,
         "decision":     decision,
         "timestamp":    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "single":       single,
         "match_a_home": match_a["home"],
         "match_a_away": match_a["away"],
-        "match_b_home": match_b["home"],
-        "match_b_away": match_b["away"],
+        "match_b_home": None if single else match_b["home"],
+        "match_b_away": None if single else match_b["away"],
         "status_a":     info_a["status"],
-        "status_b":     info_b["status"],
+        "status_b":     None if single else info_b["status"],
         "score_a":      info_a["score"],
-        "score_b":      info_b["score"],
+        "score_b":      None if single else info_b["score"],
         "start_a":      info_a["start_time"],
-        "start_b":      info_b["start_time"],
+        "start_b":      None if single else info_b["start_time"],
         "explanation":  explanation,
         "file":         str(fname),
     })
@@ -1224,6 +1304,36 @@ async def investigate_and_decide(
         )
         return False, report_path
 
+    return True, report_path
+
+
+async def investigate_single_match(
+    browser_context: object,
+    match:           dict,
+    anomaly_type:    str,
+    explanation:     str,
+    pending_reports: list[dict],
+) -> tuple[bool, Path | None]:
+    """
+    Open one flagged match, capture its page state, and save a report.
+
+    Unlike investigate_and_decide (which compares a pair), there is no
+    live/not-started false-positive rule to apply: a line-up that lists a
+    different number of players per side is wrong regardless of match status,
+    so this always alerts.
+    """
+    print(f"  [investigate] Opening flagged match page…")
+    page = await browser_context.new_page()
+    try:
+        info = await _extract_match_page_info(page, match["url"])
+    finally:
+        await page.close()
+
+    print(f"  [investigate] status={info['status']}")
+
+    report_path = _save_anomaly_report(
+        anomaly_type, match, None, info, None, explanation, "ALERTED", pending_reports
+    )
     return True, report_path
 
 
@@ -1305,6 +1415,43 @@ async def _process_sport(
         save_alerted_pairs(alerted_pairs)
     else:
         print(f"    {sname}: no duplicates detected in this cycle.")
+
+    # ── Line-up integrity (malformed doubles) ────────────────────────
+    malformed     = detect_malformed_doubles(live_entries)
+    new_malformed = [m for m in malformed if m["pair_key"] not in alerted_pairs]
+
+    if new_malformed:
+        print(f"\n[!] {sname}: {len(new_malformed)} malformed line-up(s) detected!")
+        for m in new_malformed:
+            e = m["match"]
+            print(
+                f"  [LINEUP]\n"
+                f"    {e['home']} vs {e['away']}\n"
+                f"{m['explanation']}"
+            )
+
+            should_alert, report_path = await investigate_single_match(
+                context, e, "MALFORMED_LINEUP", m["explanation"], pending_reports
+            )
+            alerted_pairs.add(m["pair_key"])
+
+            if not should_alert:
+                continue
+
+            report_note = f"\n\nReport saved: {report_path}" if report_path else ""
+            msg = (
+                f"⚠️ <b>Malformed {sname} line-up!</b>\n"
+                f"Sides list a different number of players.\n\n"
+                f"<b>Home:</b>  {e['home']}  [{m['home_players']} player(s)]\n"
+                f"<b>Away:</b>  {e['away']}  [{m['away_players']} player(s)]\n"
+                f"<b>Section:</b> {e.get('section') or 'unknown'}\n\n"
+                f"<a href='{e['url']}'>Open match</a>"
+                f"{report_note}"
+            )
+            await send_telegram(msg)
+        save_alerted_pairs(alerted_pairs)
+    else:
+        print(f"    {sname}: no line-up anomalies detected.")
 
     # ── AI analysis ───────────────────────────────────────────────────
     if ai_enabled:
