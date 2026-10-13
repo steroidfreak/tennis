@@ -102,8 +102,6 @@ MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
 # Sports to monitor — add or remove entries here to change coverage
 SPORTS: list[dict] = [
     {"name": "Tennis",     "emoji": "🎾", "url": "https://sports.dafabet.com/en/live/sport/239-TENN"},
-    {"name": "Basketball", "emoji": "🏀", "url": "https://sports.dafabet.com/en/live/sport/227-BASK"},
-    {"name": "Volleyball", "emoji": "🏐", "url": "https://sports.dafabet.com/en/live/sport/1200-VOLL"},
 ]
 
 # Keep TENNIS_URL as an alias for the --debug flag
