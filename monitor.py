@@ -78,7 +78,7 @@ def _build_telegram_recipients() -> list[tuple[str, str]]:
 TELEGRAM_RECIPIENTS: list[tuple[str, str]] = _build_telegram_recipients()
 
 # Seconds between each poll of the tennis listing page (default 1 minute)
-CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "120"))
+CHECK_INTERVAL: int       = int(os.getenv("CHECK_INTERVAL", "60"))
 
 # Heartbeat is sent daily at 07:00 UTC (no longer configurable via env)
 
@@ -1368,10 +1368,16 @@ async def _process_sport(
     for e in live_entries:
         print(f"    [LIVE]        {e['home']} vs {e['away']}")
     for e in not_started_entries:
-        print(f"    [NOT STARTED] {e['home']} vs {e['away']}  ← excluded from checks")
+        print(f"    [NOT STARTED] {e['home']} vs {e['away']}  ← pre-match duplicate check only")
 
     # ── Rule-based duplicate detection ───────────────────────────────
-    suspects = detect_duplicates(live_entries)
+    # Compare within each status group: live↔live, and not-started↔not-started
+    # so duplicates are caught before the first serve. Mixed live/not-started
+    # pairs stay excluded: investigate_and_decide would treat them as a false
+    # positive and mark the pair alerted, suppressing it once both go live.
+    suspects = detect_duplicates(live_entries) + [
+        {**s, "pre_match": True} for s in detect_duplicates(not_started_entries)
+    ]
     new_suspects = [s for s in suspects if s["pair_key"] not in alerted_pairs]
 
     if new_suspects:
@@ -1381,16 +1387,19 @@ async def _process_sport(
             b = s["match_b"]
             pct   = int(s["score"] * 100)
             label = confidence_label(s["score"])
+            pre   = s.get("pre_match", False)
+            stage = " (pre-match)" if pre else ""
 
             print(
-                f"  [{label} – {pct}%]\n"
+                f"  [{label} – {pct}%]{stage}\n"
                 f"    A: {a['home']} vs {a['away']}\n"
                 f"    B: {b['home']} vs {b['away']}\n"
                 f"{s['explanation']}"
             )
 
             should_alert, report_path = await investigate_and_decide(
-                context, a, b, "DUPLICATE", s["explanation"], pending_reports
+                context, a, b, "DUPLICATE_PREMATCH" if pre else "DUPLICATE",
+                s["explanation"], pending_reports
             )
             alerted_pairs.add(s["pair_key"])
 
@@ -1399,7 +1408,7 @@ async def _process_sport(
 
             report_note = f"\n\nReport saved: {report_path}" if report_path else ""
             msg = (
-                f"{semoji} <b>Possible duplicate {sname} match!</b>\n"
+                f"{semoji} <b>Possible duplicate {sname} match!{stage}</b>\n"
                 f"Confidence: <b>{label} ({pct}%)</b>\n\n"
                 f"<b>Match A:</b>  {a['home']}  vs  {a['away']}\n"
                 f"<b>Match B:</b>  {b['home']}  vs  {b['away']}\n\n"

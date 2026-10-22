@@ -1,6 +1,6 @@
 # Dafabet Tennis Duplicate Monitor
 
-A Python + Playwright bot that watches the live tennis page on **sports.dafabet.com** every 120 seconds, detects when the same real-world match is listed twice under slightly different player name formats, and sends an instant **Telegram alert**.
+A Python + Playwright bot that watches the live tennis page on **sports.dafabet.com** every 60 seconds, detects when the same real-world match is listed twice under slightly different player name formats, and sends an instant **Telegram alert**.
 
 **Example duplicate it catches:**
 ```
@@ -185,7 +185,7 @@ Optional overrides (add to `.env` if needed):
 
 ```ini
 HEADLESS=true              # always true on VPS (no display)
-CHECK_INTERVAL=120         # seconds between polls (default: 120)
+CHECK_INTERVAL=60          # seconds between polls (default: 60)
 SIMILARITY_THRESHOLD=0.75  # duplicate detection sensitivity (lower = more alerts)
 MIN_SIDE_SCORE=0.60        # both sides must exceed this to flag a duplicate
 AI_ANALYSIS=true           # set to false to disable MiniMax AI layer
@@ -311,7 +311,7 @@ All settings live in `.env`. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MINI
 | `TELEGRAM_BOT_TOKEN_2` | *(optional)* | Second bot token for a second recipient |
 | `TELEGRAM_CHAT_ID_2` | *(optional)* | Second chat ID for a second recipient |
 | `HEADLESS` | `true` | `false` shows the browser window (local dev only) |
-| `CHECK_INTERVAL` | `120` | Seconds between each poll of the tennis page |
+| `CHECK_INTERVAL` | `60` | Seconds between each poll of the tennis page |
 | `SIMILARITY_THRESHOLD` | `0.75` | Score above which a pair is flagged as duplicate |
 | `MIN_SIDE_SCORE` | `0.60` | Minimum score each side (home/away) must reach |
 | `AI_ANALYSIS` | `true` | Set to `false` to disable the MiniMax AI layer |
