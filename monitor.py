@@ -203,12 +203,33 @@ def _fuzzy(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _name_tokens(raw: str) -> list[str]:
+    """Sorted lowercase ASCII words of a name, ignoring commas and word order."""
+    return sorted(re.findall(r"[a-z0-9]+", _ascii_lower(raw)))
+
+
+def same_words_reordered(name_a: str, name_b: str) -> bool:
+    """
+    True when two names contain exactly the same words in a different order /
+    with the comma in a different place — e.g. multi-part names where the
+    surname/given-name split differs between listings:
+
+        "Yit May, Megan Lee"  vs  "Lee Yit May, Megan"  → same words
+
+    Requires at least two full words (2+ letters) so that a lone surname or
+    initials alone can never trigger it.
+    """
+    ta, tb = _name_tokens(name_a), _name_tokens(name_b)
+    return ta == tb and sum(1 for t in ta if len(t) >= 2) >= 2
+
+
 def player_similarity(name_a: str, name_b: str) -> float:
     """
     Return a 0.0–1.0 similarity score between two player name strings.
 
     Scoring guide:
       1.00 – identical strings
+      0.95 – same words, different order/comma ("Yit May, Megan Lee" ↔ "Lee Yit May, Megan")
       0.92 – same surname + same first initial (one may be abbreviated)
       0.85 – same surname + both full first names that look like transliterations
       0.70 – same surname, no initials to compare
@@ -223,6 +244,10 @@ def player_similarity(name_a: str, name_b: str) -> float:
 
     if a["raw_lower"] == b["raw_lower"]:
         return 1.0
+
+    # Same words, different surname/given-name split (multi-part names)
+    if same_words_reordered(name_a, name_b):
+        return 0.95
 
     surname_sim = _fuzzy(a["surname"], b["surname"])
 
@@ -449,7 +474,11 @@ def _build_ai_prompt(entries: list[dict]) -> str:
         "   are the SAME match with sides swapped.\n"
         "2. PLAYER_CONFLICT — same real player appearing in two DIFFERENT matches simultaneously.\n\n"
         "Hard rules:\n"
-        "- Different sections/tournaments → never a duplicate.\n"
+        "- Different sections/tournaments make a duplicate less likely, but the site sometimes\n"
+        "  lists the same match under two tournament names (e.g. 'Billie Jean King Cup Group III'\n"
+        "  and 'Billie Jean King Cup Zonal Groups'). If both players clearly match, still flag it.\n"
+        "- The same name may be split differently around the comma: 'Yit May, Megan Lee' and\n"
+        "  'Lee Yit May, Megan' are the same person.\n"
         "- Singles vs doubles (slash in name) → never a duplicate.\n"
         "- Surname alone is NOT enough — need first initial or full name to confirm.\n"
         "- Name format differences (comma/no comma, abbreviated/full) are expected — do not flag these alone.\n"
